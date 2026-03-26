@@ -9,23 +9,105 @@ const groq = new Groq({
 function extractJSON(content: string) {
   try {
     let text = content.trim();
+
     if (text.startsWith("```")) {
       text = text.replace(/^```[a-z]*\n/i, "").replace(/\n```$/i, "").trim();
     }
+
+    // Try direct parse
     try {
       return JSON.parse(text);
-    } catch (parseError) {
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
+    } catch { }
+
+    // Find first valid JSON object safely by progressively searching for a valid closing brace
+    const first = text.indexOf("{");
+    if (first !== -1) {
+      for (let i = text.length - 1; i > first; i--) {
+        if (text[i] === "}") {
+          const candidate = text.slice(first, i + 1);
+          try {
+            return JSON.parse(candidate);
+          } catch {
+            // Continue searching if this specific pair isn't valid JSON
+            continue;
+          }
+        }
       }
-      throw parseError;
     }
+
+    throw new Error("No valid JSON found in response");
   } catch (err) {
     console.error("JSON Parsing failed. Raw content:", content);
     throw err;
   }
 }
+
+function sanitizeMermaid(flow: string): string {
+  if (!flow) return flow;
+
+  return flow.replace(
+    /([a-zA-Z0-9_]+)\[([^\]]+)\]/g,
+    (match, node, label) => {
+      const trimmed = label.trim();
+
+      // Skip if already properly quoted
+      if (/^".*"$/.test(trimmed)) return match;
+
+      // If contains risky chars → wrap
+      if (/[()]/.test(trimmed)) {
+        const safe = trimmed.replace(/"/g, '\\"'); // escape quotes
+        return `${node}["${safe}"]`;
+      }
+
+      return match;
+    }
+  );
+}
+
+function validateMermaid(flow: string) {
+  if (!flow) return;
+
+  if (!/(graph|flowchart)\s+(TD|LR|TB|BT|RL)/i.test(flow)) {
+    throw new Error("Invalid Mermaid format: missing graph TD/LR");
+  }
+
+  // Detect ONLY unquoted parentheses
+  const unsafe = flow.match(/([a-zA-Z0-9_]+)\[([^\]]+)\]/g);
+
+  if (unsafe) {
+    for (const node of unsafe) {
+      const label = node.match(/\[(.*)\]/)?.[1];
+      if (!label) continue;
+
+      const trimmed = label.trim();
+
+      if (!/^".*"$/.test(trimmed) && /[()]/.test(trimmed)) {
+        throw new Error("Unsafe Mermaid: unquoted parentheses detected");
+      }
+    }
+  }
+}
+
+function validateStructure(obj: any) {
+  const required = [
+    "overview",
+    "features",
+    "tech_stack",
+    "steps",
+    "risks",
+    "improvements",
+    "workflow_flowchart",
+    "tech_stack_flowchart",
+    "steps_flowchart"
+  ];
+
+  for (const key of required) {
+    if (!(key in obj)) {
+      throw new Error(`Missing key: ${key}`);
+    }
+  }
+}
+
 
 export async function processIdea(messages: any[]) {
   try {
@@ -74,12 +156,17 @@ Do NOT explain anything else.`
 }
 
 export async function generateProjectStructure(context: string) {
-  try {
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [
-        {
-          role: "system",
-          content: `You are a senior system architect.
+  let attempts = 0;
+  const maxRetries = 2;
+  let lastError = "";
+
+  while (attempts <= maxRetries) {
+    try {
+      const chatCompletion = await groq.chat.completions.create({
+        messages: [
+          {
+            role: "system",
+            content: `You are a senior system architect.
 
 Your task is to convert the user's idea into a structured, buildable system.
 
@@ -116,24 +203,89 @@ MERMAID RULES:
 - Avoid excessive nesting
 - CRITICAL: If a node label contains parentheses () or special characters, you MUST wrap the label in double quotes (e.g., A["User Input (Optional)"]). Do not use unquoted parentheses in node text.
 
-If unsure, choose the simplest correct design.`
-        },
-        {
-          role: "user",
-          content: context
-        }
-      ],
-      model: "openai/gpt-oss-120b",
-      temperature: 0.2, // low temp for deterministic JSON output
-      max_tokens: 4096,
-      top_p: 1,
-    });
+If unsure, choose the simplest correct design.
 
-    const content = chatCompletion.choices[0]?.message?.content || "{}";
-    return extractJSON(content);
-  } catch (error) {
-    console.error("Groq Structure Generation Error:", error);
-    throw new Error("Failed to generate project structure: " + (error instanceof Error ? error.message : String(error)));
+STRICT FAILURE CONDITION:
+If the output is not EXACTLY valid JSON matching the schema, your response will be discarded.
+
+You MUST internally validate:
+1. JSON parses correctly
+2. All required keys exist
+3. Mermaid rules are followed
+
+Only then respond.`
+          },
+          {
+            role: "user",
+            content: attempts === 0 ? context : context + `\n\nSYSTEM ERROR (fix this in next response): ${lastError}`
+          }
+        ],
+        model: "openai/gpt-oss-120b",
+        temperature: 0.2, // low temp for deterministic JSON output
+        max_tokens: 4096,
+        top_p: 1,
+      });
+
+      const content = chatCompletion.choices[0]?.message?.content || "{}";
+      const parsed = extractJSON(content);
+
+      // Validate schema keys
+      validateStructure(parsed);
+
+      // Enforce Mermaid safety (Soft Recovery per field)
+      try {
+        if (parsed.workflow_flowchart) {
+          parsed.workflow_flowchart = sanitizeMermaid(parsed.workflow_flowchart);
+          validateMermaid(parsed.workflow_flowchart);
+        }
+      } catch {
+        parsed.workflow_flowchart = "mermaid graph TD\nA[Start] --> B[Process] --> C[End]";
+      }
+
+      try {
+        if (parsed.tech_stack_flowchart) {
+          parsed.tech_stack_flowchart = sanitizeMermaid(parsed.tech_stack_flowchart);
+          validateMermaid(parsed.tech_stack_flowchart);
+        }
+      } catch {
+        parsed.tech_stack_flowchart = "mermaid graph TD\nA[Frontend] --> B[Backend]";
+      }
+
+      try {
+        if (parsed.steps_flowchart) {
+          parsed.steps_flowchart = sanitizeMermaid(parsed.steps_flowchart);
+          validateMermaid(parsed.steps_flowchart);
+        }
+      } catch {
+        parsed.steps_flowchart = "mermaid graph TD\nA[Step 1] --> B[Step 2]";
+      }
+
+      return parsed;
+    } catch (error) {
+      attempts++;
+      lastError = String(error instanceof Error ? error.message : error);
+      console.warn(`Structure Generation Attempt ${attempts} failed:`, error);
+
+      if (attempts > maxRetries) {
+        console.warn("Full generation failed after retries, applying safe structure fallback.");
+        // We might not even have a parsed object if JSON parsing failed
+        const fallbackBase = {
+          overview: "Generation failed. Please try again with a simpler prompt.",
+          features: ["N/A"],
+          tech_stack: ["N/A"],
+          steps: ["N/A"],
+          risks: ["N/A"],
+          improvements: ["N/A"],
+        };
+
+        return {
+          ...fallbackBase,
+          workflow_flowchart: "mermaid graph TD\nA[Start] --> B[Process] --> C[End]",
+          tech_stack_flowchart: "mermaid graph TD\nA[Frontend] --> B[Backend]",
+          steps_flowchart: "mermaid graph TD\nA[Step 1] --> B[Step 2]"
+        };
+      }
+    }
   }
 }
 
@@ -211,15 +363,20 @@ Rules:
 }
 
 export async function modifyProject(currentStructure: any, userRequest: string, analysisContext?: any) {
-  try {
-    // Helper to truncate long analyst text to avoid blowing the context window
-    const truncate = (text: string, max = 800) =>
-      text && text.length > max ? text.slice(0, max) + "\n...[truncated]" : text || "";
+  let attempts = 0;
+  const maxRetries = 2;
+  let lastError = "";
 
-    // Build explicit list of keys from the current structure so the LLM knows what to preserve
-    const fieldList = Object.keys(currentStructure).join(", ");
+  while (attempts <= maxRetries) {
+    try {
+      // Helper to truncate long analyst text to avoid blowing the context window
+      const truncate = (text: string, max = 800) =>
+        text && text.length > max ? text.slice(0, max) + "\n...[truncated]" : text || "";
 
-    let systemContent = `You are a software builder.
+      // Build explicit list of keys from the current structure so the LLM knows what to preserve
+      const fieldList = Object.keys(currentStructure).join(", ");
+
+      let systemContent = `You are a software builder.
 
 Your task:
 Modify the existing project structure based on the user's request.
@@ -248,58 +405,113 @@ PRIORITY:
 2. Maintain consistency
 3. Keep structure clean
 
-If request is unclear, make the smallest reasonable change.`;
+If request is unclear, make the smallest reasonable change.
 
-    if (analysisContext && (analysisContext.archAnalysis || analysisContext.riskAnalysis)) {
-      systemContent += `\n\nCONTEXT FROM ANALYSTS:
+STRICT FAILURE CONDITION:
+If the output is not EXACTLY valid JSON matching the schema, your response will be discarded.
+
+You MUST internally validate:
+1. JSON parses correctly
+2. All required keys exist
+3. Mermaid rules are followed
+
+Only then respond.`;
+
+      if (analysisContext && (analysisContext.archAnalysis || analysisContext.riskAnalysis)) {
+        systemContent += `\n\nCONTEXT FROM ANALYSTS:
 The user might refer to advice from the system architect, risk analyst, or investor. Here is their recent feedback:
 `;
-      if (analysisContext.archAnalysis) {
-        systemContent += `\n[System Architect]:\n${truncate(analysisContext.archAnalysis)}\n`;
-      }
-      if (analysisContext.riskAnalysis) {
-        systemContent += `\n[Risk Analyst]:\n${truncate(analysisContext.riskAnalysis)}\n`;
-      }
-      if (analysisContext.investorAnalysis) {
-        systemContent += `\n[Investor]:\n${truncate(analysisContext.investorAnalysis)}\n`;
-      }
-    }
-
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [
-        {
-          role: "system",
-          content: systemContent
-        },
-        {
-          role: "user",
-          content: `Current Structure: ${JSON.stringify(currentStructure)}\nUser Request: ${userRequest}`
+        if (analysisContext.archAnalysis) {
+          systemContent += `\n[System Architect]:\n${truncate(analysisContext.archAnalysis)}\n`;
         }
-      ],
-      model: "llama-3.3-70b-versatile",
-      temperature: 0.2,
-      max_tokens: 8192,
-      top_p: 1,
-      response_format: { type: "json_object" },
-    });
+        if (analysisContext.riskAnalysis) {
+          systemContent += `\n[Risk Analyst]:\n${truncate(analysisContext.riskAnalysis)}\n`;
+        }
+        if (analysisContext.investorAnalysis) {
+          systemContent += `\n[Investor]:\n${truncate(analysisContext.investorAnalysis)}\n`;
+        }
+      }
 
-    const content = chatCompletion.choices[0]?.message?.content || "{}";
-    const parsed = extractJSON(content);
+      const chatCompletion = await groq.chat.completions.create({
+        messages: [
+          {
+            role: "system",
+            content: systemContent
+          },
+          {
+            role: "user",
+            content: attempts === 0
+              ? `Current Structure: ${JSON.stringify(currentStructure)}\nUser Request: ${userRequest}`
+              : `Current Structure: ${JSON.stringify(currentStructure)}\nUser Request: ${userRequest}\n\nSYSTEM ERROR (fix this in next response): ${lastError}`
+          }
+        ],
+        model: "llama-3.3-70b-versatile",
+        temperature: 0.2,
+        max_tokens: 8192,
+        top_p: 1,
+        response_format: { type: "json_object" },
+      });
 
-    // Deep merge: original structure is the base, LLM response overwrites only non-empty fields
-    const merged = { ...currentStructure };
-    for (const key of Object.keys(parsed)) {
-      const val = parsed[key];
-      // Only overwrite if the new value is meaningful (not empty string/array)
-      if (val === "" || val === null || val === undefined) continue;
-      if (Array.isArray(val) && val.length === 0) continue;
-      merged[key] = val;
+      const content = chatCompletion.choices[0]?.message?.content || "{}";
+      const parsed = extractJSON(content);
+
+      // Validate schema keys
+      validateStructure(parsed);
+
+      // Deep merge: original structure is the base, LLM response overwrites only non-empty fields
+      const merged = { ...currentStructure };
+      for (const key of Object.keys(parsed)) {
+        const val = parsed[key];
+        // Only overwrite if the new value is meaningful (not empty string/array)
+        if (val === "" || val === null || val === undefined) continue;
+        if (Array.isArray(val) && val.length === 0) continue;
+        merged[key] = val;
+      }
+
+      // Enforce Mermaid safety (Soft Recovery per field)
+      try {
+        if (merged.workflow_flowchart) {
+          merged.workflow_flowchart = sanitizeMermaid(merged.workflow_flowchart);
+          validateMermaid(merged.workflow_flowchart);
+        }
+      } catch {
+        merged.workflow_flowchart = "mermaid graph TD\nA[Start] --> B[Process] --> C[End]";
+      }
+
+      try {
+        if (merged.tech_stack_flowchart) {
+          merged.tech_stack_flowchart = sanitizeMermaid(merged.tech_stack_flowchart);
+          validateMermaid(merged.tech_stack_flowchart);
+        }
+      } catch {
+        merged.tech_stack_flowchart = "mermaid graph TD\nA[Frontend] --> B[Backend]";
+      }
+
+      try {
+        if (merged.steps_flowchart) {
+          merged.steps_flowchart = sanitizeMermaid(merged.steps_flowchart);
+          validateMermaid(merged.steps_flowchart);
+        }
+      } catch {
+        merged.steps_flowchart = "mermaid graph TD\nA[Step 1] --> B[Step 2]";
+      }
+
+      return merged;
+    } catch (error) {
+      attempts++;
+      lastError = String(error instanceof Error ? error.message : error);
+      console.warn(`Project Modification Attempt ${attempts} failed:`, error);
+
+      if (attempts > maxRetries) {
+        console.warn("Modification failed after retries, applying safe flowchart fallbacks on current structure.");
+        return {
+          ...currentStructure,
+          workflow_flowchart: "mermaid graph TD\nA[Start] --> B[Process] --> C[End]",
+          tech_stack_flowchart: "mermaid graph TD\nA[Frontend] --> B[Backend]",
+          steps_flowchart: "mermaid graph TD\nA[Step 1] --> B[Step 2]"
+        };
+      }
     }
-
-    return merged;
-  } catch (error) {
-    console.error("Groq Modification Error:", error);
-    throw new Error("Failed to modify project structure: " + (error instanceof Error ? error.message : String(error)));
   }
 }
 
